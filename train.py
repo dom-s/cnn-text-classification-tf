@@ -16,6 +16,7 @@ from tensorflow.contrib import learn
 tf.flags.DEFINE_float("dev_sample_percentage", .1, "Percentage of the training data to use for validation")
 tf.flags.DEFINE_string("positive_data_file", "./data/rt-polaritydata/rt-polarity.pos", "Data source for the positive data.")
 tf.flags.DEFINE_string("negative_data_file", "./data/rt-polaritydata/rt-polarity.neg", "Data source for the negative data.")
+tf.flags.DEFINE_integer("min_freq", 0, "Minimum frequency when creating dictionary")
 
 # Model Hyperparameters
 tf.flags.DEFINE_integer("embedding_dim", 128, "Dimensionality of character embedding (default: 128)")
@@ -51,7 +52,7 @@ def preprocess():
 
     # Build vocabulary
     max_document_length = max([len(x.split(" ")) for x in x_text])
-    vocab_processor = learn.preprocessing.VocabularyProcessor(max_document_length)
+    vocab_processor = learn.preprocessing.VocabularyProcessor(max_document_length, min_frequency=FLAGS.min_freq)
     x = np.array(list(vocab_processor.fit_transform(x_text)))
 
     # Randomly shuffle data
@@ -116,6 +117,9 @@ def train(x_train, y_train, vocab_processor, x_dev, y_dev):
             loss_summary = tf.summary.scalar("loss", cnn.loss)
             acc_summary = tf.summary.scalar("accuracy", cnn.accuracy)
 
+            # Batch Metrics
+            batch_summary = tf.Summary()
+
             # Train Summaries
             train_summary_op = tf.summary.merge([loss_summary, acc_summary, grad_summaries_merged])
             train_summary_dir = os.path.join(out_dir, "summaries", "train")
@@ -154,23 +158,57 @@ def train(x_train, y_train, vocab_processor, x_dev, y_dev):
                 time_str = datetime.datetime.now().isoformat()
                 print("{}: step {}, loss {:g}, acc {:g}".format(time_str, step, loss, accuracy))
                 train_summary_writer.add_summary(summaries, step)
+                batch_summary.value.add(tag="accuracy", simple_value=accuracy)
+                batch_summary.value.add(tag="loss", simple_value=loss)
+                train_summary_writer.add_summary(batch_summary, step)
 
             def dev_step(x_batch, y_batch, writer=None):
                 """
                 Evaluates model on a dev set
                 """
-                feed_dict = {
-                  cnn.input_x: x_batch,
-                  cnn.input_y: y_batch,
-                  cnn.dropout_keep_prob: 1.0
-                }
-                step, summaries, loss, accuracy = sess.run(
-                    [global_step, dev_summary_op, cnn.loss, cnn.accuracy],
-                    feed_dict)
+                dev_batches = data_helpers.batch_iter(
+                    list(zip(x_batch, y_batch)), FLAGS.batch_size, 1)
+                total_losses = np.array([], dtype="float32")
+                total_predictions = np.array([], dtype=int)
+                counter = 0
+                for dev_batch in dev_batches:
+                    counter += 1
+                    dev_x_batch, dev_y_batch = zip(*dev_batch)
+                    feed_dict = {
+                        cnn.input_x: dev_x_batch,
+                        cnn.input_y: dev_y_batch,
+                        cnn.dropout_keep_prob: 1.0
+                    }
+                    step, loss_vals, dev_predictions = sess.run(
+                        [global_step, cnn.loss, cnn.predictions], feed_dict)
+                    # print("dev_predictions: ", dev_predictions)
+                    total_losses = np.hstack((total_losses, loss_vals))
+                    total_predictions = np.concatenate((total_predictions, dev_predictions), axis=0)
+                    # if writer:
+                    #     writer.add_summary(summaries, step)
+                loss_tensor = tf.reduce_mean(total_losses)
+                correct_predictions = tf.equal(total_predictions, tf.argmax(y_batch, 1))
+                accuracy_tensor = tf.reduce_mean(tf.cast(correct_predictions, "float"), name="accuracy")
                 time_str = datetime.datetime.now().isoformat()
-                print("{}: step {}, loss {:g}, acc {:g}".format(time_str, step, loss, accuracy))
+                step, loss, accuracy = sess.run(
+                    [global_step, loss_tensor, accuracy_tensor])
+
+                batch_summary.value.add(tag="accuracy", simple_value=accuracy)
+                batch_summary.value.add(tag="loss", simple_value=loss)
+
                 if writer:
-                    writer.add_summary(summaries, step)
+                    writer.add_summary(batch_summary, step)
+
+                print("{}: step {}, loss: {:g}, acc: {:g}".format(time_str, step, loss, accuracy))
+                # now write the summaries
+                # total_loss_summary = tf.summary.scalar("loss", loss)
+                # total_acc_summary = tf.summary.scalar("accuracy", accuracy)
+                # dev_summary_op = tf.summary.merge([total_loss_summary, total_acc_summary])
+                # summaries = sess.run(dev_summary_op, feed_dict={acc_summary: accuracy, loss_summary: loss})
+
+                return accuracy
+
+            max_accuracy = 0.0
 
             # Generate batches
             batches = data_helpers.batch_iter(
@@ -182,11 +220,15 @@ def train(x_train, y_train, vocab_processor, x_dev, y_dev):
                 current_step = tf.train.global_step(sess, global_step)
                 if current_step % FLAGS.evaluate_every == 0:
                     print("\nEvaluation:")
-                    dev_step(x_dev, y_dev, writer=dev_summary_writer)
+                    accuracy = dev_step(x_dev, y_dev, writer=dev_summary_writer)
                     print("")
-                if current_step % FLAGS.checkpoint_every == 0:
-                    path = saver.save(sess, checkpoint_prefix, global_step=current_step)
-                    print("Saved model checkpoint to {}\n".format(path))
+                    if accuracy > max_accuracy:
+                        max_accuracy = accuracy
+                        path = saver.save(sess, checkpoint_prefix, global_step=current_step)
+                        print("Saved model checkpoint to {}\n".format(path))
+                # if current_step % FLAGS.checkpoint_every == 0:
+                #     path = saver.save(sess, checkpoint_prefix, global_step=current_step)
+                #     print("Saved model checkpoint to {}\n".format(path))
 
 def main(argv=None):
     x_train, y_train, vocab_processor, x_dev, y_dev = preprocess()
